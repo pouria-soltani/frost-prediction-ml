@@ -3,7 +3,9 @@ import numpy as np
 from sklearn.mixture import GaussianMixture
 from xgboost import XGBRegressor
 from sklearn.multioutput import MultiOutputRegressor
-from sklearn.metrics import mean_absolute_error, f1_score
+from sklearn.metrics import mean_absolute_error, roc_auc_score, log_loss
+from sklearn.model_selection import TimeSeriesSplit
+from scipy.stats import norm
 from tabulate import tabulate
 import warnings
 
@@ -17,7 +19,6 @@ class DataEngine:
     def load_and_preprocess(self):
         df = pd.read_csv(self.filepath, skiprows=1, parse_dates=["datetime"])
         df = df.sort_values("datetime").reset_index(drop=True)
-
         features = ["tmin", "tmax", "td_m", "um", "ffm"]
         df[features] = df[features].interpolate(method="linear").bfill().ffill()
         return df
@@ -27,8 +28,18 @@ class FeatureFactory:
     def __init__(self, n_components=3):
         self.n_components = n_components
         self.gmm = GaussianMixture(n_components=self.n_components, random_state=42)
+        self.is_fitted = False
 
-    def engineer_features(self, df):
+    def fit(self, df):
+        gmm_cols = ["tmin", "tmax", "td_m", "um", "ffm"]
+        self.gmm.fit(df[gmm_cols])
+        self.is_fitted = True
+        return self
+
+    def transform(self, df):
+        if not self.is_fitted:
+            raise ValueError("FeatureFactory must be fitted on train data first!")
+
         df = df.copy()
 
         time_diff = df["datetime"].diff().dt.total_seconds() / 3600.0
@@ -52,9 +63,6 @@ class FeatureFactory:
         df["cos_doy"] = np.cos(2 * np.pi * df["day_of_year"] / 365.25)
 
         gmm_cols = ["tmin", "tmax", "td_m", "um", "ffm"]
-        if not hasattr(self.gmm, "means_"):
-            self.gmm.fit(df[gmm_cols])
-
         gmm_probs = self.gmm.predict_proba(df[gmm_cols])
         for i in range(self.n_components):
             df[f"gmm_prob_{i}"] = gmm_probs[:, i]
@@ -67,29 +75,27 @@ class TargetGenerator:
         target_cols = ["tmin", "tmax", "td_m", "ffm"]
         for col in target_cols:
             df[f"{col}_next"] = df[col].shift(-1)
-
         return df.dropna(subset=[f"{col}_next" for col in target_cols]).copy()
 
 
-class FrostRuleEngine:
-    @staticmethod
-    def apply_rules(tmin, tmax, td_m, ffm):
-        c1 = (tmin <= 0.0) & (ffm <= 2.0) & ((tmax - tmin) > 10.0)
-        c2 = (tmin <= 0.0) & (ffm > 2.0)
-        c3 = (tmin <= 0.0) & (td_m < tmin)
+class FrostRiskEngine:
+    def __init__(self, historical_mae_tmin=2.0):
+        self.sigma = historical_mae_tmin * np.sqrt(np.pi / 2.0)
 
-        return np.select([c1, c2, c3], [1, 2, 3], default=0)
+    def calculate_risk_probability(self, predicted_tmin, threshold=0.0):
+        z_scores = (threshold - predicted_tmin) / self.sigma
+        return norm.cdf(z_scores)
 
 
 class ForecastModelTrainer:
     def __init__(self):
         base_estimator = XGBRegressor(
-            max_depth=5,
-            learning_rate=0.03,
-            n_estimators=300,
+            max_depth=4,
+            learning_rate=0.05,
+            n_estimators=150,
             subsample=0.8,
             colsample_bytree=0.8,
-            objective="reg:pseudohubererror",
+            objective="reg:squarederror",
             random_state=42,
             n_jobs=-1,
         )
@@ -97,59 +103,79 @@ class ForecastModelTrainer:
 
     def train(self, X, y):
         critical_mask = y.iloc[:, 0] <= 2.0
-        sample_weights = np.where(critical_mask, 5.0, 1.0)
-
+        sample_weights = np.where(critical_mask, 3.0, 1.0)
         self.model.fit(X, y, sample_weight=sample_weights)
         return self.model
 
 
 class BenchmarkSuite:
-    def evaluate(self, df, feature_cols, target_cols, model):
-        X = df[feature_cols]
-        Y_true = df[target_cols].values
+    def evaluate_split(self, model, X_test, Y_test, risk_engine):
+        Y_pred = model.predict(X_test)
 
-        Y_pred = model.predict(X)
+        mae_tmin = mean_absolute_error(Y_test[:, 0], Y_pred[:, 0])
 
-        mae_tmin = mean_absolute_error(Y_true[:, 0], Y_pred[:, 0])
-        mae_td = mean_absolute_error(Y_true[:, 2], Y_pred[:, 2])
+        actual_frost = (Y_test[:, 0] <= 0.0).astype(int)
 
-        critical_idx = Y_true[:, 0] <= 0.0
-        if np.any(critical_idx):
-            mae_critical_tmin = mean_absolute_error(
-                Y_true[critical_idx, 0], Y_pred[critical_idx, 0]
-            )
+        frost_probs = risk_engine.calculate_risk_probability(Y_pred[:, 0])
+
+        if len(np.unique(actual_frost)) > 1:
+            auc = roc_auc_score(actual_frost, frost_probs)
+            logloss = log_loss(actual_frost, frost_probs)
         else:
-            mae_critical_tmin = 0.0
+            auc, logloss = np.nan, np.nan
 
-        true_classes = FrostRuleEngine.apply_rules(
-            Y_true[:, 0], Y_true[:, 1], Y_true[:, 2], Y_true[:, 3]
-        )
-        pred_classes = FrostRuleEngine.apply_rules(
-            Y_pred[:, 0], Y_pred[:, 1], Y_pred[:, 2], Y_pred[:, 3]
-        )
+        return mae_tmin, auc, logloss
 
-        acc = np.mean(true_classes == pred_classes)
-        f1_macro = f1_score(
-            true_classes, pred_classes, average="macro", zero_division=0
-        )
+    def run_time_series_cv(self, df, feature_cols, target_cols, n_splits=4):
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        risk_engine = FrostRiskEngine(historical_mae_tmin=2.0)
 
-        results = [
-            ["Global MAE (T_min) °C", f"{mae_tmin:.4f}"],
-            ["Critical MAE (T_min <= 0) °C", f"{mae_critical_tmin:.4f}"],
-            ["Global MAE (T_dew) °C", f"{mae_td:.4f}"],
-            ["Frost Rule Accuracy", f"{acc:.4f}"],
-            ["Frost Rule F1-Macro", f"{f1_macro:.4f}"],
+        results_list = []
+        fold = 1
+
+        print("\n=== Probabilistic Risk Engine Fold-by-Fold Analysis ===")
+        for train_index, test_index in tscv.split(df):
+            df_train = df.iloc[train_index].copy()
+            df_test = df.iloc[test_index].copy()
+
+            factory = FeatureFactory(n_components=3)
+            factory.fit(df_train)
+            df_train_feat = factory.transform(df_train)
+            df_test_feat = factory.transform(df_test)
+
+            X_train, Y_train = df_train_feat[feature_cols], df_train_feat[target_cols]
+            X_test, Y_test = (
+                df_test_feat[feature_cols],
+                df_test_feat[target_col_names].values,
+            )
+
+            trainer = ForecastModelTrainer()
+            trainer.train(X_train, Y_train)
+
+            mae, auc, logloss = self.evaluate_split(
+                trainer.model, X_test, Y_test, risk_engine
+            )
+            results_list.append([mae, auc, logloss])
+
+            print(
+                f"Fold {fold} | MAE: {mae:.2f}°C | AUC-ROC: {auc:.4f} | LogLoss: {logloss:.4f}"
+            )
+            fold += 1
+
+        avg_metrics = np.nanmean(results_list, axis=0)
+
+        report = [
+            ["Global MAE (T_min) °C", f"{avg_metrics[0]:.4f}"],
+            ["Frost Risk AUC-ROC", f"{avg_metrics[1]:.4f}"],
+            ["Frost Risk LogLoss", f"{avg_metrics[2]:.4f}"],
         ]
-
-        print(tabulate(results, headers=["Metric", "Value"], tablefmt="pipe"))
+        print(f"\n--- Final Production Pipeline Evaluation ---")
+        print(tabulate(report, headers=["Metric", "Average Value"], tablefmt="pipe"))
 
 
 if __name__ == "__main__":
     data_engine = DataEngine("data/records.csv")
     df = data_engine.load_and_preprocess()
-
-    feature_factory = FeatureFactory(n_components=3)
-    df = feature_factory.engineer_features(df)
 
     target_gen = TargetGenerator()
     df = target_gen.prepare_regression_targets(df)
@@ -175,10 +201,7 @@ if __name__ == "__main__":
         "gmm_prob_1",
         "gmm_prob_2",
     ]
-    target_cols = ["tmin_next", "tmax_next", "td_m_next", "ffm_next"]
-
-    model_trainer = ForecastModelTrainer()
-    model_trainer.train(df[feature_cols], df[target_cols])
+    target_col_names = ["tmin_next", "tmax_next", "td_m_next", "ffm_next"]
 
     benchmark = BenchmarkSuite()
-    benchmark.evaluate(df, feature_cols, target_cols, model_trainer.model)
+    benchmark.run_time_series_cv(df, feature_cols, target_col_names, n_splits=4)
