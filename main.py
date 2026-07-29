@@ -55,23 +55,28 @@ class FeatureFactory:
         time_diff = df["datetime"].diff().dt.total_seconds() / 3600.0
         time_diff = time_diff.replace(0, np.nan).fillna(24.0)
         df["lapse_rate"] = (df["tmin"].diff() / time_diff).bfill()
-
+        
         df["dtr"] = df["tmax"] - df["tmin"]
         df["dtr_lag_1"] = df["dtr"].shift(1).bfill()
 
         for i in range(1, 4):
             df[f"tmin_lag_{i}"] = df["tmin"].shift(i).bfill()
             df[f"ffm_lag_{i}"] = df["ffm"].shift(i).bfill()
+        for i in [5, 7]:
+            df[f"tmin_lag_{i}"] = df["tmin"].shift(i).bfill()
+            df[f"ffm_lag_{i}"] = df["ffm"].shift(i).bfill()     
 
         df["td_m_roll_3"] = df["td_m"].rolling(window=3, min_periods=1).mean()
         df["tmin_volatility_3d"] = (
             df["tmin"].rolling(window=3, min_periods=1).std().fillna(0)
         )
-
+        df["tmin_ewma_3"] = df["tmin"].ewm(span=3, adjust=False).mean()
+        df["td_m_ewma_3"] = df["td_m"].ewm(span=3, adjust=False).mean()
         df["day_of_year"] = df["datetime"].dt.dayofyear
         df["sin_doy"] = np.sin(2 * np.pi * df["day_of_year"] / 365.25)
         df["cos_doy"] = np.cos(2 * np.pi * df["day_of_year"] / 365.25)
-
+        df["um_ffm_interaction"] = df["um"] * df["ffm"]
+        
         gmm_cols = ["tmin", "tmax", "td_m", "um", "ffm"]
         gmm_probs = self.gmm.predict_proba(df[gmm_cols])
         for i in range(self.n_components):
@@ -288,7 +293,54 @@ class BenchmarkSuite:
         else:
             plt.show()
 
+    def run_ablation_study(self, df, base_feature_cols, target_cols, new_feature_cols,
+                            n_splits=4, random_state=42, trainer_kwargs=None,
+                            gmm_n_components=3, importance_threshold=0.01):
+        trainer_kwargs = trainer_kwargs or {}
+        tscv = TimeSeriesSplit(n_splits=n_splits)
 
+        gmm_cols = [f"gmm_prob_{i}" for i in range(gmm_n_components)]
+        feature_cols = base_feature_cols + gmm_cols
+
+        train_index, _ = list(tscv.split(df))[-1]
+        df_train = df.iloc[train_index].copy()
+
+        factory = FeatureFactory(n_components=gmm_n_components, random_state=random_state)
+        factory.fit(df_train)
+        df_train_feat = factory.transform(df_train)
+
+        X_train = df_train_feat[feature_cols]
+        Y_train = df_train_feat[target_cols]
+
+        trainer = ForecastModelTrainer(random_state=random_state, **trainer_kwargs)
+        trainer.train(X_train, Y_train)
+
+        importance_matrix = np.array([
+            est.feature_importances_ for est in trainer.model.estimators_
+        ])
+        avg_importance = importance_matrix.mean(axis=0)
+        tmin_importance = importance_matrix[target_cols.index("tmin_next")]
+
+        report_df = pd.DataFrame({
+            "feature": feature_cols,
+            "is_new_feature": [f in new_feature_cols for f in feature_cols],
+            "importance_tmin_next": tmin_importance,
+            "importance_avg_all_targets": avg_importance,
+        }).sort_values("importance_avg_all_targets", ascending=False).reset_index(drop=True)
+
+        max_importance = report_df["importance_avg_all_targets"].max()
+        low_importance_mask = (
+            (report_df["importance_avg_all_targets"] < importance_threshold * max_importance)
+            & (report_df["is_new_feature"])
+        )
+        low_importance_features = report_df.loc[low_importance_mask, "feature"].tolist()
+
+        print("\n--- Ablation Study: Feature Importance ---")
+        print(tabulate(report_df, headers="keys", tablefmt="pipe", showindex=False))
+        print(f"\nLow-importance NEW features (< {importance_threshold*100:.0f}% of max importance, safe to drop):")
+        print(low_importance_features if low_importance_features else "None")
+
+        return report_df, low_importance_features
 
 class HyperparameterOptimizer:
     
@@ -413,7 +465,9 @@ if __name__ == "__main__":
         "lapse_rate", "dtr", "dtr_lag_1",
         "tmin_lag_1", "tmin_lag_2", "tmin_lag_3", "ffm_lag_1",
         "td_m_roll_3", "tmin_volatility_3d",
-        "sin_doy", "cos_doy",
+        "sin_doy", "cos_doy","tmin_ewma_3", "td_m_ewma_3",
+        "um_ffm_interaction",
+        "tmin_lag_5", "tmin_lag_7", "ffm_lag_5", "ffm_lag_7",
     ]
     target_col_names = ["tmin_next", "tmax_next", "td_m_next", "ffm_next"]
 
@@ -425,7 +479,19 @@ if __name__ == "__main__":
                              subsample=0.8, colsample_bytree=0.8),
         gmm_n_components=3,
     )
-
+    print("\n################ ABLATION STUDY (New Features) ################")
+    new_feature_cols = [
+        "tmin_ewma_3", "td_m_ewma_3",
+        "um_ffm_interaction",
+        "tmin_lag_5", "tmin_lag_7", "ffm_lag_5", "ffm_lag_7",
+    ]
+    ablation_report, low_importance_features = bench.run_ablation_study(
+        df, base_feature_cols, target_col_names, new_feature_cols,
+        n_splits=4,
+        trainer_kwargs=dict(max_depth=4, learning_rate=0.05, n_estimators=150,
+                             subsample=0.8, colsample_bytree=0.8),
+        gmm_n_components=3,
+    )
     print("\n################ OPTUNA SEARCH (Issue #3) ################")
     optimizer = HyperparameterOptimizer(df, base_feature_cols, target_col_names, n_splits=4)
     study = optimizer.run(n_trials=60)
