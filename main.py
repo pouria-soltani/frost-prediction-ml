@@ -417,6 +417,35 @@ class BenchmarkSuite:
         return report_df, low_importance_features
 
 
+class FrostClassificationWrapper:
+    """
+    Bridges the gap between Continuous Probabilistic ML and Discrete Business Requirements.
+    Converts the ML predictions back into the Proposal's predefined Classes (0, 1, 2, 3).
+    """
+
+    def __init__(self, risk_threshold=0.50):
+        self.risk_threshold = risk_threshold
+
+    def classify(self, preds, risk_prob):
+        tmin_pred, tmax_pred, tdew_pred, wind_pred = (
+            preds[0],
+            preds[1],
+            preds[2],
+            preds[3],
+        )
+
+        if risk_prob < self.risk_threshold:
+            return 0, "NORMAL (No Frost) - Class 0"
+
+        # If risk is high enough, determine the TYPE of frost based on predicted thermodynamics
+        if tdew_pred < tmin_pred:
+            return 3, "BLACK FROST (Dry Freeze) - Class 3"
+        elif wind_pred > 2.0:
+            return 2, "ADVECTION FROST (Windy) - Class 2"
+        else:
+            return 1, "RADIATION FROST (Clear Sky) - Class 1"
+
+
 class ExplainabilityEngine:
     def __init__(self, model, feature_names):
         self.model = model
@@ -761,6 +790,53 @@ if __name__ == "__main__":
     print(
         f"Frost Risk Probability: {day_explanation['frost_risk_probability'] * 100:.1f}%"
     )
+
+    print(
+        "\n################ FINAL BUSINESS CLASSIFICATION (API RESPONSE) ################"
+    )
+    wrapper = FrostClassificationWrapper(risk_threshold=0.50)
+
+    # Get all 4 multi-output predictions for the sample day [tmin, tmax, td_m, ffm]
+    latest_preds = final_trainer.model.predict(sample_day)[0]
+
+    final_class, class_msg = wrapper.classify(
+        latest_preds, day_explanation["frost_risk_probability"]
+    )
+
+    import json
+
+    business_output = {
+        "date_target": "t+1 (Tomorrow)",
+        "predicted_thermodynamics": {
+            "tmin": float(round(latest_preds[0], 2)),
+            "tmax": float(round(latest_preds[1], 2)),
+            "tdew": float(round(latest_preds[2], 2)),
+            "wind": float(round(latest_preds[3], 2)),
+        },
+        "frost_risk_probability_pct": float(
+            round(day_explanation["frost_risk_probability"] * 100, 1)
+        ),
+        "final_frost_class": int(final_class),
+        "alert_message": class_msg,
+    }
+
+    print(json.dumps(business_output, indent=4))
+
+    # =====================================================================
+    # SAVING MODELS FOR PRODUCTION (API)
+    # =====================================================================
+    import joblib
+    import os
+
+    print("\n################ SAVING MODELS FOR PRODUCTION ################")
+    os.makedirs("models", exist_ok=True)
+
+    joblib.dump(final_factory, "models/feature_factory.joblib")
+    joblib.dump(final_trainer, "models/xgboost_trainer.joblib")
+    joblib.dump(risk_engine_final, "models/risk_engine.joblib")
+    joblib.dump(wrapper, "models/classification_wrapper.joblib")
+
+    print("All models successfully saved to the 'models/' directory. Ready for API!")
 
     # print("\n################ EXPLAINABILITY TEST — FROST DAY ################")
 
