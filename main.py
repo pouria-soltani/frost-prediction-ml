@@ -13,6 +13,14 @@ warnings.filterwarnings("ignore")
 
 
 class DataEngine:
+    """
+    Loads raw sensor data. Only forward-looking gap filling is done here
+    (ffill), since it never uses a future observation to patch a past one.
+    Any imputation that could see 'the future' (linear interpolation,
+    bfill) is deliberately NOT done globally anymore -- it's leakage-prone
+    when later split into train/test folds.
+    """
+
     def __init__(self, filepath):
         self.filepath = filepath
 
@@ -20,11 +28,20 @@ class DataEngine:
         df = pd.read_csv(self.filepath, skiprows=1, parse_dates=["datetime"])
         df = df.sort_values("datetime").reset_index(drop=True)
         features = ["tmin", "tmax", "td_m", "um", "ffm"]
-        df[features] = df[features].interpolate(method="linear").bfill().ffill()
+        
+        df[features] = df[features].ffill()
         return df
 
 
 class FeatureFactory:
+    """
+    Fit/transform split so the GMM (and any future fitted imputers) only
+    ever see train-fold statistics. NaNs produced by shift()/diff() at the
+    start of a fold are left as NaN on purpose -- XGBoost handles missing
+    values natively, so there's no need to bfill them (which would leak
+    a future-in-fold value backwards).
+    """
+
     def __init__(self, n_components=3):
         self.n_components = n_components
         self.gmm = GaussianMixture(n_components=self.n_components, random_state=42)
@@ -44,19 +61,20 @@ class FeatureFactory:
 
         time_diff = df["datetime"].diff().dt.total_seconds() / 3600.0
         time_diff = time_diff.replace(0, np.nan).fillna(24.0)
-        df["lapse_rate"] = (df["tmin"].diff() / time_diff).bfill()
+        df["lapse_rate"] = df["tmin"].diff() / time_diff
 
         df["dtr"] = df["tmax"] - df["tmin"]
-        df["dtr_lag_1"] = df["dtr"].shift(1).bfill()
+        df["dtr_lag_1"] = df["dtr"].shift(1)
 
         for i in range(1, 4):
-            df[f"tmin_lag_{i}"] = df["tmin"].shift(i).bfill()
-            df[f"ffm_lag_{i}"] = df["ffm"].shift(i).bfill()
+            df[f"tmin_lag_{i}"] = df["tmin"].shift(i)
+            df[f"ffm_lag_{i}"] = df["ffm"].shift(i)
 
         df["td_m_roll_3"] = df["td_m"].rolling(window=3, min_periods=1).mean()
         df["tmin_volatility_3d"] = (
-            df["tmin"].rolling(window=3, min_periods=1).std().fillna(0)
+            df["tmin"].rolling(window=3, min_periods=1).std()
         )
+        
 
         df["day_of_year"] = df["datetime"].dt.dayofyear
         df["sin_doy"] = np.sin(2 * np.pi * df["day_of_year"] / 365.25)
@@ -98,6 +116,7 @@ class ForecastModelTrainer:
             objective="reg:squarederror",
             random_state=42,
             n_jobs=-1,
+            missing=np.nan,
         )
         self.model = MultiOutputRegressor(base_estimator)
 
@@ -146,7 +165,7 @@ class BenchmarkSuite:
             X_train, Y_train = df_train_feat[feature_cols], df_train_feat[target_cols]
             X_test, Y_test = (
                 df_test_feat[feature_cols],
-                df_test_feat[target_col_names].values,
+                df_test_feat[target_cols].values,
             )
 
             trainer = ForecastModelTrainer()
@@ -158,18 +177,18 @@ class BenchmarkSuite:
             results_list.append([mae, auc, logloss])
 
             print(
-                f"Fold {fold} | MAE: {mae:.2f}°C | AUC-ROC: {auc:.4f} | LogLoss: {logloss:.4f}"
+                f"Fold {fold} | MAE: {mae:.2f}\u00b0C | AUC-ROC: {auc:.4f} | LogLoss: {logloss:.4f}"
             )
             fold += 1
 
         avg_metrics = np.nanmean(results_list, axis=0)
 
         report = [
-            ["Global MAE (T_min) °C", f"{avg_metrics[0]:.4f}"],
+            ["Global MAE (T_min) \u00b0C", f"{avg_metrics[0]:.4f}"],
             ["Frost Risk AUC-ROC", f"{avg_metrics[1]:.4f}"],
             ["Frost Risk LogLoss", f"{avg_metrics[2]:.4f}"],
         ]
-        print(f"\n--- Final Production Pipeline Evaluation ---")
+        print("\n--- Final Production Pipeline Evaluation ---")
         print(tabulate(report, headers=["Metric", "Average Value"], tablefmt="pipe"))
 
 
