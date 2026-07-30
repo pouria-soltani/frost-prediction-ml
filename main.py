@@ -51,7 +51,7 @@ class FeatureFactory:
     a future-in-fold value backwards).
     """
 
-    def __init__(self, n_components=3):
+    def __init__(self, n_components=3, random_state=42):
         self.n_components = n_components
         self.gmm = GaussianMixture(
             n_components=self.n_components, random_state=random_state
