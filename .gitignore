@@ -221,3 +221,7 @@ __marimo__/
 # Reports
 .tmp/
 *.diff
+*.png
+*.jpg
+*.jpeg
+*.joblib
