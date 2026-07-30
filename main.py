@@ -10,6 +10,7 @@ from ngboost import NGBRegressor
 from ngboost.distns import Normal
 from sklearn.calibration import calibration_curve
 from tabulate import tabulate
+import shap
 import matplotlib.pyplot as plt
 import warnings
 
@@ -342,6 +343,80 @@ class BenchmarkSuite:
 
         return report_df, low_importance_features
 
+
+class ExplainabilityEngine:
+    def __init__(self, model, feature_names):
+        self.model = model
+        self.feature_names = feature_names
+        self.explainer = shap.TreeExplainer(self.model)
+
+    def compute_shap_values(self, X):
+        return self.explainer.shap_values(X)
+
+    def plot_global_summary(self, X, save_path=None):
+        shap_values = self.compute_shap_values(X)
+        plt.figure()
+        shap.summary_plot(shap_values, X, feature_names=self.feature_names, show=False)
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.close()
+        else:
+            plt.show()
+        return shap_values
+
+    def plot_dependence(self, feature, X, shap_values=None,
+                         interaction_feature="auto", save_path=None):
+        if shap_values is None:
+            shap_values = self.compute_shap_values(X)
+        plt.figure()
+        shap.dependence_plot(feature, shap_values, X,
+                              feature_names=self.feature_names,
+                              interaction_index=interaction_feature, show=False)
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.close()
+        else:
+            plt.show()
+
+    def explain_single_day(self, X_row, top_n=3):
+        shap_values = self.compute_shap_values(X_row)
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+        row_shap = shap_values[0]
+
+        base_value = self.explainer.expected_value
+        if isinstance(base_value, (list, np.ndarray)):
+            base_value = base_value[0]
+
+        contributions = sorted(
+            zip(self.feature_names, row_shap),
+            key=lambda c: abs(c[1]), reverse=True
+        )[:top_n]
+
+        top_drivers = [{
+            "feature": name,
+            "shap_value": float(val),
+            "direction": "increases_tmin" if val > 0 else "decreases_tmin",
+        } for name, val in contributions]
+
+        predicted_tmin = float(base_value + row_shap.sum())
+
+        return {
+            "base_value": float(base_value),
+            "predicted_tmin": predicted_tmin,
+            "top_drivers": top_drivers,
+        }
+
+    def explain_day_with_risk(self, X_row, risk_engine, threshold=0.0, top_n=3):
+        explanation = self.explain_single_day(X_row, top_n=top_n)
+        risk_prob = risk_engine.calculate_risk_probability(
+            np.array([explanation["predicted_tmin"]]), threshold=threshold
+        )[0]
+        explanation["frost_risk_probability"] = float(risk_prob)
+        return explanation
+
+
+        
 class HyperparameterOptimizer:
     
 
@@ -509,3 +584,60 @@ if __name__ == "__main__":
 
     paths = optimizer.report(output_dir=".")
     print(f"\nSaved reports: {paths}")
+
+    print("\n################ EXPLAINABILITY (SHAP) ################")
+
+    final_n_components = best_trial.params["n_components"]
+    final_factory = FeatureFactory(n_components=final_n_components, random_state=42)
+    final_factory.fit(df)
+    df_feat = final_factory.transform(df)
+
+    gmm_cols = [f"gmm_prob_{i}" for i in range(final_n_components)]
+    feature_cols = base_feature_cols + gmm_cols
+
+    X_full = df_feat[feature_cols]
+    Y_full = df_feat[target_col_names]
+
+    final_trainer_kwargs = {k: v for k, v in best_trial.params.items() if k != "n_components"}
+    final_trainer = ForecastModelTrainer(random_state=42, **final_trainer_kwargs)
+    final_trainer.train(X_full, Y_full)
+
+    tmin_estimator = final_trainer.model.estimators_[target_col_names.index("tmin_next")]
+    explainer_engine = ExplainabilityEngine(tmin_estimator, feature_cols)
+
+    explainer_engine.plot_global_summary(X_full, save_path="shap_summary.png")
+    explainer_engine.plot_dependence("dtr", X_full, save_path="shap_dependence_dtr.png")
+
+    sample_day = X_full.iloc[[-1]]
+    risk_engine_final = FrostRiskEngine(historical_mae_tmin=2.0)
+    day_explanation = explainer_engine.explain_day_with_risk(sample_day, risk_engine_final)
+
+    print("\n--- Local Explanation for Latest Day ---")
+    print(tabulate(
+        [[d["feature"], f"{d['shap_value']:+.4f}", d["direction"]] for d in day_explanation["top_drivers"]],
+        headers=["Feature", "SHAP Value", "Effect"], tablefmt="pipe"
+    ))
+    print(f"Predicted T-min: {day_explanation['predicted_tmin']:.2f}°C")
+    print(f"Frost Risk Probability: {day_explanation['frost_risk_probability']*100:.1f}%")
+
+
+
+
+
+    
+    # print("\n################ EXPLAINABILITY TEST — FROST DAY ################")
+
+    # coldest_idx = df_feat["tmin_next"].idxmin()
+    # print(f"Coldest day actual tmin_next: {df_feat.loc[coldest_idx, 'tmin_next']:.2f}°C")
+    # print(f"Date: {df_feat.loc[coldest_idx, 'datetime']}")
+
+    # frost_day_sample = X_full.loc[[coldest_idx]]
+    # frost_day_explanation = explainer_engine.explain_day_with_risk(frost_day_sample, risk_engine_final)
+
+    # print("\n--- Local Explanation for Coldest Day ---")
+    # print(tabulate(
+    #     [[d["feature"], f"{d['shap_value']:+.4f}", d["direction"]] for d in frost_day_explanation["top_drivers"]],
+    #     headers=["Feature", "SHAP Value", "Effect"], tablefmt="pipe"
+    # ))
+    # print(f"Predicted T-min: {frost_day_explanation['predicted_tmin']:.2f}°C")
+    # print(f"Frost Risk Probability: {frost_day_explanation['frost_risk_probability']*100:.1f}%")
