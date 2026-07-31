@@ -1,89 +1,115 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List
-import pandas as pd
+import yaml
 import joblib
-import json
+import pandas as pd
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import List
+import uvicorn
 
-app = FastAPI(title="Frost Risk Prediction API", version="1.0.0")
+from main import (
+    FeatureFactory, 
+    ForecastModelTrainer, 
+    FrostRiskEngine, 
+    FrostClassificationWrapper
+)
 
-# In a real production environment, these paths point to the models saved at the end of main.py
-# e.g., joblib.dump(final_trainer, "models/xgboost_trainer.joblib")
+# === THE FIX FOR JOBLIB PICKLE NAMESPACE CLASH ===
+import __main__
+__main__.FeatureFactory = FeatureFactory
+__main__.ForecastModelTrainer = ForecastModelTrainer
+__main__.FrostRiskEngine = FrostRiskEngine
+__main__.FrostClassificationWrapper = FrostClassificationWrapper
+# ==================================================
+
+# Load Configurations
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+# Initialize Models globally...
 try:
-    # We use mock placeholders here to demonstrate the architecture
-    # feature_factory = joblib.load("models/feature_factory.joblib")
-    # model_trainer = joblib.load("models/xgboost_trainer.joblib")
-    # risk_engine = joblib.load("models/risk_engine.joblib")
-    # wrapper = joblib.load("models/classification_wrapper.joblib")
-    print("Models loaded successfully into RAM.")
+    factory = joblib.load(config["models"]["feature_factory"])
+    trainer = joblib.load(config["models"]["xgboost_trainer"])
+    risk_engine = joblib.load(config["models"]["risk_engine"])
+    wrapper = joblib.load(config["models"]["classification_wrapper"])
 except Exception as e:
-    print("Warning: Models not found. Train main.py and save them first.")
+    raise RuntimeError(f"Failed to load models from disk. Error: {e}")
 
+# Reconstruct feature column order expected by the model
+base_features = [
+    "tmin", "tmax", "td_m", "um", "ffm", "lapse_rate", "dtr", "dtr_lag_1",
+    "tmin_lag_1", "tmin_lag_2", "tmin_lag_3", "ffm_lag_1", "td_m_roll_3",
+    "tmin_volatility_3d", "sin_doy", "cos_doy", "tmin_ewma_3", "td_m_ewma_3",
+    "um_ffm_interaction", "tmin_lag_5", "tmin_lag_7", "ffm_lag_5", "ffm_lag_7"
+]
+gmm_cols = [f"gmm_prob_{i}" for i in range(factory.n_components)]
+MODEL_FEATURES = base_features + gmm_cols
 
+# Initialize API
+app = FastAPI(title="Frost Prediction API - ML Engine", version="1.0.0")
+
+# Pydantic Schemas for Strict Data Validation
 class DailyWeatherRecord(BaseModel):
-    datetime: str  # Format: "YYYY-MM-DD"
+    datetime: str = Field(..., description="Date format: YYYY-MM-DD")
     tmin: float
     tmax: float
     td_m: float
     um: float
     ffm: float
 
+class PredictionRequest(BaseModel):
+    history: List[DailyWeatherRecord] = Field(
+        ..., 
+        min_length=config["inference"]["history_window_days"],
+        max_length=config["inference"]["history_window_days"],
+        description=f"Requires exactly {config['inference']['history_window_days']} days of historical data for lag/ewma computation."
+    )
 
-class InferencePayload(BaseModel):
-    # The API strictly requires the last 10 days of data to compute lag_7 and EWMA features
-    historical_window: List[DailyWeatherRecord]
-
-
-@app.post("/predict")
-async def predict_frost_risk(payload: InferencePayload):
-    # 1. Validate input length to ensure we can calculate 7-day lags
-    if len(payload.historical_window) < 10:
-        raise HTTPException(
-            status_code=400,
-            detail="Payload must contain at least 10 historical daily records to compute temporal features.",
-        )
-
+@app.post("/predict", tags=["Inference"])
+def predict_frost(request: PredictionRequest):
     try:
-        # 2. Convert the incoming JSON payload into a Pandas DataFrame
-        df_raw = pd.DataFrame([record.dict() for record in payload.historical_window])
-        df_raw["datetime"] = pd.to_datetime(df_raw["datetime"])
-        df_raw = df_raw.sort_values("datetime").reset_index(drop=True)
-
-        # 3. Apply causal imputation (forward fill only) to handle any missing sensors in the payload
-        features = ["tmin", "tmax", "td_m", "um", "ffm"]
-        df_raw[features] = df_raw[features].ffill()
-
-        # 4. Transform raw data into ML features (Lags, EWMA, GMM Probs)
-        # df_features = feature_factory.transform(df_raw)
-
-        # 5. Extract only the VERY LAST ROW (Today) to predict Tomorrow (t+1)
-        # sample_today = df_features.iloc[[-1]]
-
-        # 6. Run Inference (Mocked logic for illustration)
-        # preds = model_trainer.model.predict(sample_today)[0]
-        # risk_prob = risk_engine.calculate_risk_probability(preds[0])
-        # final_class, class_msg = wrapper.classify(preds, risk_prob)
-
-        # 7. Formulate the exact JSON response promised in the proposal
-        business_output = {
+        # 1. Parse Input to DataFrame
+        df = pd.DataFrame([record.model_dump() for record in request.history])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime").reset_index(drop=True)
+        
+        # 2. Extract Features using Factory
+        df_feat = factory.transform(df)
+        
+        # 3. Slice the latest day (which now contains all computed lags from history)
+        X_latest = df_feat[MODEL_FEATURES].iloc[[-1]]
+        
+        # 4. Multi-Output Prediction: [tmin_next, tmax_next, td_m_next, ffm_next]
+        preds = trainer.model.predict(X_latest)[0]
+        
+        # 5. Probabilistic Risk Scoring
+        risk_prob = risk_engine.calculate_risk_probability(np.array([preds[0]]))[0]
+        
+        # 6. Business Logic Classification
+        final_class, class_msg = wrapper.classify(preds, risk_prob)
+        
+        return {
             "date_target": "t+1 (Tomorrow)",
             "predicted_thermodynamics": {
-                "tmin": 11.93,  # Mock: round(preds[0], 2)
-                "tmax": 24.51,  # Mock: round(preds[1], 2)
-                "tdew": 8.12,  # Mock: round(preds[2], 2)
-                "wind": 1.2,  # Mock: round(preds[3], 2)
+                "tmin": float(round(preds[0], 2)),
+                "tmax": float(round(preds[1], 2)),
+                "tdew": float(round(preds[2], 2)),
+                "wind": float(round(preds[3], 2)),
             },
-            "frost_risk_probability_pct": 0.0,  # Mock: round(risk_prob * 100, 1)
-            "final_frost_class": 0,  # Mock: final_class
-            "alert_message": "NORMAL (No Frost) - Class 0",  # Mock: class_msg
+            "frost_risk_probability_pct": float(round(risk_prob * 100, 1)),
+            "final_frost_class": int(final_class),
+            "alert_message": class_msg
         }
 
-        return business_output
-
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing expected feature computation: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Internal inference error: {e}")
 
-
-@app.get("/health")
-async def health_check():
-    return {"status": "Operational", "model_version": "1.0.0"}
+if __name__ == "__main__":
+    uvicorn.run(
+        "api:app", 
+        host=config["server"]["host"], 
+        port=config["server"]["port"], 
+        reload=config["server"].get("reload", False)
+    )

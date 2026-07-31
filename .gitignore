@@ -225,3 +225,5 @@ __marimo__/
 *.jpg
 *.jpeg
 *.joblib
+models/
+reports/

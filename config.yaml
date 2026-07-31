@@ -1,0 +1,11 @@
+inference:
+  history_window_days: 10
+models:
+  classification_wrapper: models/classification_wrapper.joblib
+  feature_factory: models/feature_factory.joblib
+  risk_engine: models/risk_engine.joblib
+  xgboost_trainer: models/xgboost_trainer.joblib
+server:
+  host: 0.0.0.0
+  port: 8000
+  reload: false
