@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>سامانه پایش ریسک یخبندان</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="frost-field"></div>
+
+<header class="topbar">
+    <div class="topbar__brand">
+        <span class="topbar__glyph">❄</span>
+        <div>
+            <h1>پایش ریسک یخبندان</h1>
+            <p>پیش‌بینی دمای فردا و طبقه‌بندی خطر بر پایه ۱۰ روز داده تاریخی</p>
+        </div>
+    </div>
+</header>
+
+<main class="layout">
+
+    <!-- ===================== INPUT PANEL ===================== -->
+    <section class="panel panel--input">
+        <div class="tabs">
+            <button type="button" class="tab active" data-tab="manual">ورود دستی</button>
+            <button type="button" class="tab" data-tab="csv">بارگذاری CSV</button>
+        </div>
+
+        <form id="predict-form">
+
+            <!-- MANUAL TABLE -->
+            <div class="tab-panel active" id="panel-manual">
+                <p class="hint">۱۰ روز آخر را از قدیمی‌ترین به جدیدترین وارد کنید.</p>
+                <div class="table-scroll">
+                    <table class="entry-table">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>تاریخ</th>
+                                <th>دمای حداقل</th>
+                                <th>دمای حداکثر</th>
+                                <th>نقطه شبنم</th>
+                                <th>رطوبت </th>
+                                <th>باد </th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for i in range(window) %}
+                            <tr>
+                                <td class="row-index">{{ i + 1 }}</td>
+                                <td><input type="date" name="datetime_{{ i }}" value="{{ default_dates[i] }}" required></td>
+                                <td><input type="number" step="0.01" name="tmin_{{ i }}" placeholder="°C" required></td>
+                                <td><input type="number" step="0.01" name="tmax_{{ i }}" placeholder="°C" required></td>
+                                <td><input type="number" step="0.01" name="td_m_{{ i }}" placeholder="°C" required></td>
+                                <td><input type="number" step="0.01" name="um_{{ i }}" placeholder="%" required></td>
+                                <td><input type="number" step="0.01" name="ffm_{{ i }}" placeholder="m/s" required></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                <input type="hidden" name="mode" id="mode-field" value="manual">
+            </div>
+
+            <!-- CSV UPLOAD -->
+            <div class="tab-panel" id="panel-csv">
+                <p class="hint">
+                    فایل CSV باید ستون‌های <code>datetime, tmin, tmax, td_m, um, ffm</code> را داشته باشد.
+                    اگر بیش از ۱۰ ردیف باشد، ۱۰ ردیف آخر (جدیدترین تاریخ‌ها) استفاده می‌شود.
+                </p>
+                <label class="dropzone" id="dropzone">
+                    <input type="file" name="csv_file" id="csv-file" accept=".csv">
+                    <span id="dropzone-text">فایل CSV را انتخاب یا رها کنید</span>
+                </label>
+            </div>
+
+            <button type="submit" class="btn-submit" id="submit-btn">
+                <span class="btn-text">دریافت پیش‌بینی فردا</span>
+                <span class="btn-spinner" hidden></span>
+            </button>
+
+            <div class="form-error" id="form-error" hidden></div>
+        </form>
+    </section>
+
+    <!-- ===================== RESULT PANEL ===================== -->
+    <section class="panel panel--result" id="result-panel">
+        <div class="result-empty" id="result-empty">
+            <span class="result-empty__glyph">❄</span>
+            <p>پس از ثبت داده، نتیجه پیش‌بینی و درصد قطعیت ریسک یخبندان اینجا نمایش داده می‌شود.</p>
+        </div>
+
+        <div class="result-content" id="result-content" hidden>
+
+            <div class="class-badge" id="class-badge">
+                <span class="class-badge__label" id="class-label"></span>
+                <span class="class-badge__msg" id="class-msg"></span>
+            </div>
+
+            <div class="gauge-wrap">
+                <div class="gauge" id="gauge">
+                    <div class="gauge__value" id="gauge-value">0%</div>
+                </div>
+                <p class="gauge__caption">درصد قطعیت ریسک یخبندان</p>
+            </div>
+
+            <div class="metrics-grid">
+                <div class="metric">
+                    <span class="metric__label">حداقل دما پیش‌بینی</span>
+                    <span class="metric__value" id="m-tmin">—</span>
+                </div>
+                <div class="metric">
+                    <span class="metric__label">حداکثر دما پیش‌بینی</span>
+                    <span class="metric__value" id="m-tmax">—</span>
+                </div>
+                <div class="metric">
+                    <span class="metric__label">نقطه شبنم</span>
+                    <span class="metric__value" id="m-tdew">—</span>
+                </div>
+                <div class="metric">
+                    <span class="metric__label">سرعت باد</span>
+                    <span class="metric__value" id="m-wind">—</span>
+                </div>
+            </div>
+
+            <p class="result-target" id="result-target"></p>
+        </div>
+    </section>
+
+</main>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
